@@ -105,6 +105,74 @@ policies, so it can read nothing.
 CI re-exports `SUPABASE_*` values from `supabase status` after `supabase
 start`, so the suite always runs against what actually started.
 
+## P1 — the MCP path: OAuth 2.1 resource server
+
+P1 adds a second authenticated surface: the MCP endpoint at `/mcp`
+(Streamable HTTP, stateless, JSON responses). The ledger is an **OAuth 2.1
+resource server** and Auth0 remains the only authorization server — we issue
+no tokens and run no login UI. Implemented against the current MCP
+authorization spec (revision **2025-11-25**, read from the spec source while
+building):
+
+```
+Claude / ChatGPT ── POST /mcp (no token) ──> 401
+    WWW-Authenticate: Bearer ..., resource_metadata=
+        "https://<host>/.well-known/oauth-protected-resource/mcp"
+    └─> client fetches that metadata → authorization_servers = [Auth0 tenant]
+        → discovers Auth0 (RFC 8414 / OIDC), registers itself (RFC 7591 DCR),
+          runs OAuth 2.1 + PKCE, returns with an access token
+Claude / ChatGPT ── POST /mcp (Bearer access token) ──> tools
+```
+
+Spec conformance points:
+
+* **RFC 9728 Protected Resource Metadata** served at both forms the spec
+  lists: path-inserted `/.well-known/oauth-protected-resource/mcp` (primary,
+  served by the MCP app) and root `/.well-known/oauth-protected-resource`
+  (fallback alias). `resource` comes from `RESOURCE_SERVER_URL` — set it to
+  the public URL when tunneling or deploying.
+* **401 challenges** carry `resource_metadata` in `WWW-Authenticate` (the
+  spec's primary discovery mechanism).
+* **Token validation**: every MCP request is verified by the same
+  `app/auth.py` code path as P0 — RS256 against the tenant JWKS (cached),
+  issuer, expiry — with the audience check extended to accept the **ledger
+  API identifier** (`AUTH0_API_AUDIENCE`) alongside the P0 client-ID
+  audience. Tokens not minted for this resource are rejected (the spec's
+  audience-binding MUST).
+* **Client identity**: the OAuth client ID arrives in the access token's
+  `azp` claim and keys the per-user `clients` registry row (created on first
+  contact with default scopes `{personal, work}`; revoked rows reject calls
+  with instructions to re-enable in the dashboard). If `azp` were ever
+  absent, a stable hash of the token's issuer+audience stands in.
+
+### Spec deviation log (P1)
+
+* **Auth0 does not implement RFC 8707 `resource`.** MCP clients MUST send the
+  `resource` parameter; Auth0 ignores it and uses its proprietary `audience`
+  parameter instead. Bridge: set the tenant **Default Audience** to the
+  ledger API identifier (docs/CONNECT.md Part 1.3) so tokens still arrive
+  audience-bound to the ledger. The server's own audience validation is what
+  enforces the spec's token-binding requirement.
+* **DB access token exchange.** The spec's security best practices forbid
+  **token passthrough**, and Auth0 access tokens cannot carry the literal
+  `role` claim PostgREST needs (stripped from access tokens, see P0 notes).
+  So the MCP layer never forwards the inbound token: after verification it
+  mints a short-lived (120 s) HS256 Data-API JWT for the *same verified
+  `sub`* signed with `SUPABASE_JWT_SECRET`, and uses that through the anon
+  client. Postgres RLS still enforces per-user isolation — the minted token
+  carries one `sub` and cannot bypass anything; the service role remains
+  unused on the request path. This refines P0's "caller's JWT" rule: the
+  caller's *identity* flows to Postgres; the caller's *credential* does not
+  transit beyond verification. (Hosted Supabase: requires the project's
+  legacy HS256 JWT secret to remain enabled.)
+* **Doc verification limits of this build environment.** The MCP spec was
+  verified from its source repository; Auth0's DCR docs and OpenAI's
+  connector docs were unreachable (network policy), so the Auth0 steps in
+  CONNECT.md follow the documented tenant flags as last known, and the
+  ChatGPT `search`/`fetch` result shapes were taken from OpenAI's official
+  deep-research MCP sample server (cookbook). Re-verify both consoles' UI
+  paths on first real connect.
+
 ## Workaround log
 
 * **No workaround needed for third-party auth itself**, but note the ID-token
@@ -123,11 +191,13 @@ start`, so the suite always runs against what actually started.
 | Variable | Meaning |
 | --- | --- |
 | `AUTH0_DOMAIN` | Tenant domain; issuer is `https://$AUTH0_DOMAIN/`, JWKS is fetched from it |
-| `AUTH0_AUDIENCE` | Accepted `aud` — the Auth0 application client ID (ID tokens) |
+| `AUTH0_AUDIENCE` | Accepted `aud` — the Auth0 application client ID (ID tokens, P0 path) |
+| `AUTH0_API_AUDIENCE` | Accepted `aud` — the Auth0 API identifier for the ledger (access tokens, MCP path) |
+| `RESOURCE_SERVER_URL` | Canonical public URL of `/mcp`; advertised as the RFC 9728 `resource` |
 | `SUPABASE_URL` | Supabase project / local stack URL |
 | `SUPABASE_ANON_KEY` | Publishable key; request path, RLS enforced |
 | `SUPABASE_SERVICE_ROLE_KEY` | BYPASSRLS key; pipeline jobs only |
-| `SUPABASE_JWT_SECRET` | Tests only: local stack's HS256 secret for minting user JWTs |
+| `SUPABASE_JWT_SECRET` | HS256 Data-API secret: the MCP layer mints short-lived per-user DB tokens with it; tests mint user JWTs with it |
 
 `server/app/config.py` loads these via pydantic-settings and raises at startup
 if any are missing — the app refuses to boot half-configured.

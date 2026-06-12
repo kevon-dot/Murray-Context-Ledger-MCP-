@@ -42,6 +42,8 @@ _ENV_DEFAULTS = {
     # no network calls are made). The RLS suite does not involve Auth0 at all.
     "AUTH0_DOMAIN": "murray-test.us.auth0.com",
     "AUTH0_AUDIENCE": "murray-ledger-test-client",
+    # Ledger API identifier: the audience carried by MCP access tokens.
+    "AUTH0_API_AUDIENCE": "https://ledger.test/mcp",
 }
 for _key, _value in _ENV_DEFAULTS.items():
     os.environ.setdefault(_key, _value)
@@ -83,3 +85,53 @@ def make_test_user(label: str) -> TestUser:
     """Unique Auth0-shaped principal per test run, so runs never collide."""
     unique = uuid.uuid4().hex[:12]
     return TestUser(sub=f"auth0|itest-{label}-{unique}", email=f"{label}-{unique}@example.com")
+
+
+def mint_access_token(private_key, sub: str, azp: str, ttl_seconds: int = 600) -> str:
+    """Sign an Auth0-shaped *access token* for the MCP path.
+
+    Pairs with a stubbed JWKS (the matching public key), mirroring what Auth0
+    issues after the OAuth flow: RS256, ledger API audience, `azp` carrying
+    the OAuth client id, space-separated `scope`.
+    """
+    now = int(time.time())
+    claims = {
+        "sub": sub,
+        "azp": azp,
+        "scope": "openid profile email",
+        "iss": f"https://{os.environ['AUTH0_DOMAIN']}/",
+        "aud": os.environ["AUTH0_API_AUDIENCE"],
+        "iat": now,
+        "exp": now + ttl_seconds,
+    }
+    return jwt.encode(claims, private_key, algorithm="RS256", headers={"kid": "test-key"})
+
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+def mcp_headers(token: str | None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def mcp_rpc(
+    client, method: str, params: dict | None = None, token: str | None = None, id_: int = 1
+):
+    """POST one JSON-RPC request to /mcp and return the httpx response."""
+    body = {"jsonrpc": "2.0", "id": id_, "method": method, "params": params or {}}
+    return client.post("/mcp", json=body, headers=mcp_headers(token))
+
+
+def mcp_call_tool(client, token: str, name: str, arguments: dict | None = None) -> dict:
+    """Call a tool and return the JSON-RPC `result` (CallToolResult shape)."""
+    response = mcp_rpc(client, "tools/call", {"name": name, "arguments": arguments or {}}, token)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "error" not in payload, payload
+    return payload["result"]

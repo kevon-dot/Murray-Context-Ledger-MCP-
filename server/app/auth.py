@@ -43,14 +43,19 @@ def _unauthorized() -> HTTPException:
 
 
 def verify_token(token: str, settings: Settings) -> dict[str, Any]:
-    """Validate an Auth0 RS256 JWT and return its claims; raise 401 otherwise."""
+    """Validate an Auth0 RS256 JWT and return its claims; raise 401 otherwise.
+
+    Accepts either configured audience: the Auth0 application client ID (ID
+    tokens, P0 request path) or the ledger API identifier (access tokens, MCP
+    path). PyJWT treats an audience list as "any of these".
+    """
     try:
         signing_key = _jwks_client(settings.auth0_jwks_url).get_signing_key_from_jwt(token)
         return jwt.decode(
             token,
             signing_key.key,
             algorithms=ALLOWED_ALGORITHMS,
-            audience=settings.auth0_audience,
+            audience=settings.accepted_audiences,
             issuer=settings.auth0_issuer,
             options={"require": ["exp", "iat", "iss", "aud", "sub"]},
         )
