@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv (with Python 3.12)
+        # setup-uv publishes exact release tags only (no floating major ref).
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Auth + app tests (no database)
+        run: uv run pytest tests/test_auth.py tests/test_health.py -v
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v2
+        with:
+          version: "2.106.0"
+
+      - name: Start local Supabase stack (applies migrations)
+        run: supabase start
+
+      # Defaults in tests/conftest.py already match a default local stack; this
+      # re-exports the started stack's actual values so CI never drifts.
+      - name: Point tests at the started stack
+        run: |
+          supabase status -o env \
+            | sed -nE 's/^API_URL="?([^"]*)"?$/SUPABASE_URL=\1/p;
+                       s/^ANON_KEY="?([^"]*)"?$/SUPABASE_ANON_KEY=\1/p;
+                       s/^SERVICE_ROLE_KEY="?([^"]*)"?$/SUPABASE_SERVICE_ROLE_KEY=\1/p;
+                       s/^JWT_SECRET="?([^"]*)"?$/SUPABASE_JWT_SECRET=\1/p' \
+            >> "$GITHUB_ENV"
+
+      - name: RLS isolation suite — the P0 acceptance gate
+        run: uv run pytest tests/test_rls_isolation.py -v
