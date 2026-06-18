@@ -23,16 +23,24 @@ from fastapi.testclient import TestClient
 import app.auth as app_auth
 from app.db import service_client
 from app.mcp_server import PROFILE_TOKEN_BUDGET
-from conftest import make_test_user, mcp_call_tool, mint_access_token
+from conftest import (
+    add_membership,
+    cleanup_orgs,
+    make_test_org,
+    make_test_user,
+    mcp_call_tool,
+    mint_access_token,
+)
 
 B_MARKER = "ZZYZX-B-ONLY-MARKER"
 CLIENT_A = "client-claude-test"
 CLIENT_B = "client-chatgpt-test"
 
 
-def _fact(user_sub, type_, content, scopes=("personal",), confidence=0.8):
+def _fact(user_sub, type_, content, org_id, *, scopes=("personal",), confidence=0.8):
     return {
         "user_id": user_sub,
+        "org_id": org_id,
         "type": type_,
         "content": content,
         "source": "user_manual",
@@ -98,25 +106,43 @@ def user_crowd():
 def db_service(user_a, user_b, user_crowd):
     service = service_client()
     yield service
-    subs = [user_a.sub, user_b.sub, user_crowd.sub]
-    for table in ("audit_log", "facts", "jobs", "clients"):
-        service.table(table).delete().in_("user_id", subs).execute()
+    cleanup_orgs(service, [user_a.sub, user_b.sub, user_crowd.sub])
 
 
 @pytest.fixture(scope="module")
-def seeded(db_service, user_a, user_b, user_crowd):
+def orgs(db_service, user_a, user_b, user_crowd):
+    """Each user owns their own org, so the P0/P1 per-user isolation assertions
+    now hold at the org boundary. `owner` means P6 role-scoping never narrows
+    them, so scope behavior here is driven purely by client granted_scopes —
+    exactly as in P1."""
+    org_a = make_test_org(db_service, "mcp-org-a")
+    org_b = make_test_org(db_service, "mcp-org-b")
+    org_crowd = make_test_org(db_service, "mcp-org-crowd")
+    add_membership(db_service, org_a, user_a.sub, "owner")
+    add_membership(db_service, org_b, user_b.sub, "owner")
+    add_membership(db_service, org_crowd, user_crowd.sub, "owner")
+    return {"a": org_a, "b": org_b, "crowd": org_crowd}
+
+
+@pytest.fixture(scope="module")
+def seeded(db_service, orgs, user_a, user_b, user_crowd):
+    org_a, org_b, org_crowd = orgs["a"], orgs["b"], orgs["crowd"]
     rows = [
         _fact(
             user_a.sub,
             "identity",
             "Murray Tester is a product designer based in Austin.",
+            org_a,
             confidence=0.95,
         ),
-        _fact(user_a.sub, "preference", "Prefers espresso over filter coffee.", confidence=0.9),
+        _fact(
+            user_a.sub, "preference", "Prefers espresso over filter coffee.", org_a, confidence=0.9
+        ),
         _fact(
             user_a.sub,
             "style",
             "Prefers blunt, concise feedback on drafts.",
+            org_a,
             scopes=("work",),
             confidence=0.85,
         ),
@@ -124,6 +150,7 @@ def seeded(db_service, user_a, user_b, user_crowd):
             user_a.sub,
             "state",
             "Currently migrating the Murray app billing to Stripe.",
+            org_a,
             scopes=("work",),
             confidence=0.7,
         ),
@@ -131,17 +158,19 @@ def seeded(db_service, user_a, user_b, user_crowd):
             user_a.sub,
             "episodic",
             "Visited the Austin design conference last week.",
+            org_a,
             confidence=0.6,
         ),
         _fact(
             user_a.sub,
             "state",
             "Tracking marathon training recovery after an ankle sprain.",
+            org_a,
             scopes=("health",),
             confidence=0.75,
         ),
-        _fact(user_b.sub, "identity", f"{B_MARKER} belongs to user B and must never leak."),
-        _fact(user_b.sub, "preference", f"{B_MARKER} user B prefers tea."),
+        _fact(user_b.sub, "identity", f"{B_MARKER} belongs to user B and must never leak.", org_b),
+        _fact(user_b.sub, "preference", f"{B_MARKER} user B prefers tea.", org_b),
     ]
     # A crowd of long preference facts to pressure the profile token budget.
     rows += [
@@ -149,6 +178,7 @@ def seeded(db_service, user_a, user_b, user_crowd):
             user_crowd.sub,
             "preference",
             f"Crowd preference number {i:03d}: " + ("enjoys long-form documentation " * 6),
+            org_crowd,
             confidence=0.5 + (i % 50) / 100,
         )
         for i in range(200)

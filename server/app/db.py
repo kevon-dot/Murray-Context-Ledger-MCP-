@@ -50,13 +50,19 @@ def service_client() -> Client:
     return create_client(settings.supabase_url, settings.supabase_service_role_key, options)
 
 
-def mint_db_token(sub: str, email: str | None = None) -> str:
+def mint_db_token(sub: str, email: str | None = None, org_ids: list[str] | None = None) -> str:
     """Short-lived Data-API JWT for an already-verified caller.
 
     Carries exactly the claims PostgREST needs: the caller's ``sub`` (what RLS
     policies match on) and ``role: authenticated`` (what PostgREST switches
     Postgres roles on). Call this only with a ``sub`` taken from a token that
     `app.auth.verify_token` accepted.
+
+    ``org_ids`` is optional and forward-looking only: when supplied it is added
+    as an ``org_ids`` claim (list of strings) for clients that already know the
+    caller's orgs. RLS does NOT read this claim — isolation is resolved in
+    Postgres by ``auth.user_org_ids()`` from the memberships table — so no
+    policy depends on it and it is safe to omit.
     """
     settings = get_settings()
     now = int(time.time())
@@ -70,9 +76,13 @@ def mint_db_token(sub: str, email: str | None = None) -> str:
     }
     if email:
         claims["email"] = email
+    if org_ids is not None:
+        claims["org_ids"] = [str(org_id) for org_id in org_ids]
     return jwt.encode(claims, settings.supabase_jwt_secret, algorithm="HS256")
 
 
-def client_for_subject(sub: str, email: str | None = None) -> Client:
+def client_for_subject(
+    sub: str, email: str | None = None, org_ids: list[str] | None = None
+) -> Client:
     """RLS-enforced client for a verified subject (the MCP request path)."""
-    return user_client(mint_db_token(sub, email))
+    return user_client(mint_db_token(sub, email, org_ids))

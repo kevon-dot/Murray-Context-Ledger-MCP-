@@ -82,6 +82,14 @@ REVOKED_CLIENT_MESSAGE = (
     "This client's access to the ledger has been revoked. Ask the user to "
     "re-enable it in their ledger dashboard, then try again."
 )
+NO_ORG_MESSAGE = (
+    "This account is not a member of any ledger org yet. Ask an admin to "
+    "provision a seat for you, then try again."
+)
+MULTI_ORG_MESSAGE = (
+    "This account belongs to more than one org, which is not supported in v1. "
+    "Each user must map to exactly one org."
+)
 
 
 class Auth0AccessTokenVerifier:
@@ -163,6 +171,8 @@ def build_mcp() -> FastMCP:
 class ToolContext:
     db: Client
     user_sub: str
+    org_id: str
+    role: str
     client_row_id: str
     granted_scopes: list[str]
     tool: str
@@ -176,10 +186,16 @@ def _begin(tool: str, arguments: dict[str, Any]) -> ToolContext:
         raise ValueError("Unauthenticated MCP request reached a tool handler.")
     claims = token.claims or {}
     db = client_for_subject(token.subject, claims.get("email"))
-    client_row = _resolve_client(db, token.subject, token.client_id)
+    # Resolve the caller's single org + role BEFORE touching any org-scoped
+    # table — the audit row itself carries org_id, so there is nothing to write
+    # until this succeeds. Fails closed on 0 or >1 memberships.
+    org_id, role = _resolve_membership(db, token.subject)
+    client_row = _resolve_client(db, org_id, token.subject, token.client_id)
     ctx = ToolContext(
         db=db,
         user_sub=token.subject,
+        org_id=org_id,
+        role=role,
         client_row_id=client_row["id"],
         granted_scopes=list(client_row["granted_scopes"]),
         tool=tool,
@@ -191,16 +207,37 @@ def _begin(tool: str, arguments: dict[str, Any]) -> ToolContext:
     return ctx
 
 
-def _resolve_client(db: Client, user_sub: str, oauth_client_id: str) -> dict[str, Any]:
+def _resolve_membership(db: Client, user_sub: str) -> tuple[str, str]:
+    """Resolve the caller's (org_id, role) from their memberships.
+
+    Read through the caller-scoped client: the ``memberships_select_self`` RLS
+    policy returns exactly this user's rows, so no service-role read is needed
+    on the request path. v1 binds exactly one org and fails closed otherwise.
+    """
+    rows = db.table("memberships").select("org_id,role").eq("user_id", user_sub).execute().data
+    if not rows:
+        raise ValueError(NO_ORG_MESSAGE)
+    if len(rows) > 1:
+        # TODO(multi-org): v1 deliberately binds a single org. To support
+        # switching, accept an org selector on the tool/connector and pick among
+        # `rows` here instead of raising — auth.user_org_ids() already returns an
+        # array, so the RLS layer needs no change.
+        raise ValueError(MULTI_ORG_MESSAGE)
+    return rows[0]["org_id"], rows[0]["role"]
+
+
+def _resolve_client(db: Client, org_id: str, user_sub: str, oauth_client_id: str) -> dict[str, Any]:
     """Find or create the ledger `clients` row for this OAuth client identity.
 
-    Existing rows are never modified here (in particular, a revoked client is
-    not flipped back to active by reconnecting).
+    Connectors are per-org (keyed (org_id, oauth_client_id), matching
+    clients_org_oauth_client_idx), so the same OAuth client is a distinct seat
+    in each org. Existing rows are never modified here (in particular, a revoked
+    client is not flipped back to active by reconnecting).
     """
     found = (
         db.table("clients")
         .select("id,granted_scopes,status")
-        .eq("user_id", user_sub)
+        .eq("org_id", org_id)
         .eq("oauth_client_id", oauth_client_id)
         .execute()
         .data
@@ -212,6 +249,7 @@ def _resolve_client(db: Client, user_sub: str, oauth_client_id: str) -> dict[str
             db.table("clients")
             .insert(
                 {
+                    "org_id": org_id,
                     "user_id": user_sub,
                     "oauth_client_id": oauth_client_id,
                     "display_name": oauth_client_id,
@@ -226,7 +264,7 @@ def _resolve_client(db: Client, user_sub: str, oauth_client_id: str) -> dict[str
             return (
                 db.table("clients")
                 .select("id,granted_scopes,status")
-                .eq("user_id", user_sub)
+                .eq("org_id", org_id)
                 .eq("oauth_client_id", oauth_client_id)
                 .execute()
                 .data[0]
@@ -240,6 +278,7 @@ def _finish(ctx: ToolContext, fact_ids: list[str]) -> None:
     ctx.db.table("audit_log").insert(
         {
             "user_id": ctx.user_sub,
+            "org_id": ctx.org_id,
             "client_id": ctx.client_row_id,
             "tool": ctx.tool,
             "payload_hash": hashlib.sha256(payload.encode()).hexdigest(),
