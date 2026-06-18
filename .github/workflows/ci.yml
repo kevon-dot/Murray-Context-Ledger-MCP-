@@ -48,5 +48,5 @@ jobs:
                        s/^JWT_SECRET="?([^"]*)"?$/SUPABASE_JWT_SECRET=\1/p' \
             >> "$GITHUB_ENV"
 
-      - name: RLS isolation suite — the P0 acceptance gate
-        run: uv run pytest tests/test_rls_isolation.py -v
+      - name: Full suite — RLS isolation gate + MCP protocol and tools
+        run: uv run pytest -v

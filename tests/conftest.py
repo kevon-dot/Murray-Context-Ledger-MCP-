@@ -42,6 +42,8 @@ _ENV_DEFAULTS = {
     # no network calls are made). The RLS suite does not involve Auth0 at all.
     "AUTH0_DOMAIN": "murray-test.us.auth0.com",
     "AUTH0_AUDIENCE": "murray-ledger-test-client",
+    # Ledger API identifier: the audience carried by MCP access tokens.
+    "AUTH0_API_AUDIENCE": "https://ledger.test/mcp",
 }
 for _key, _value in _ENV_DEFAULTS.items():
     os.environ.setdefault(_key, _value)
@@ -83,3 +85,101 @@ def make_test_user(label: str) -> TestUser:
     """Unique Auth0-shaped principal per test run, so runs never collide."""
     unique = uuid.uuid4().hex[:12]
     return TestUser(sub=f"auth0|itest-{label}-{unique}", email=f"{label}-{unique}@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Org tenancy (P2+) — service-role provisioning helpers.
+#
+# Orgs and memberships are provisioned by the service role in v1 (no
+# authenticated insert path), so these helpers take a service client. Tokens
+# stay sub-only: RLS resolves the caller's org from memberships in Postgres, so
+# the minting helpers above are unchanged and carry no org claim.
+# ---------------------------------------------------------------------------
+
+
+def make_test_org(service, name: str = "Test Org") -> str:
+    """Create an org via the service client; return its uuid."""
+    return service.table("orgs").insert({"name": name}).execute().data[0]["id"]
+
+
+def add_membership(service, org_id: str, user_sub: str, role: str = "rep") -> None:
+    """Attach a user (Auth0 sub) to an org with a role, via the service client."""
+    service.table("memberships").insert(
+        {"org_id": org_id, "user_id": user_sub, "role": role}
+    ).execute()
+
+
+def make_org_user(service, label: str, org_id: str, role: str = "rep") -> TestUser:
+    """A fresh test user already a member of `org_id` with `role` — the common
+    case (v1 assumes exactly one org per user)."""
+    user = make_test_user(label)
+    add_membership(service, org_id, user.sub, role)
+    return user
+
+
+def cleanup_orgs(service, user_subs: list[str]) -> None:
+    """Tear down all rows created for `user_subs`, FK-safe.
+
+    Child rows (facts/clients/audit_log/jobs carry org_id) and memberships are
+    removed before the orgs they reference. Org ids are discovered from the
+    users' memberships so callers need not track them.
+    """
+    member_rows = (
+        service.table("memberships").select("org_id").in_("user_id", user_subs).execute().data
+    )
+    org_ids = list({row["org_id"] for row in member_rows})
+    for table in ("audit_log", "facts", "jobs", "clients"):
+        service.table(table).delete().in_("user_id", user_subs).execute()
+    service.table("memberships").delete().in_("user_id", user_subs).execute()
+    if org_ids:
+        service.table("orgs").delete().in_("id", org_ids).execute()
+
+
+def mint_access_token(private_key, sub: str, azp: str, ttl_seconds: int = 600) -> str:
+    """Sign an Auth0-shaped *access token* for the MCP path.
+
+    Pairs with a stubbed JWKS (the matching public key), mirroring what Auth0
+    issues after the OAuth flow: RS256, ledger API audience, `azp` carrying
+    the OAuth client id, space-separated `scope`.
+    """
+    now = int(time.time())
+    claims = {
+        "sub": sub,
+        "azp": azp,
+        "scope": "openid profile email",
+        "iss": f"https://{os.environ['AUTH0_DOMAIN']}/",
+        "aud": os.environ["AUTH0_API_AUDIENCE"],
+        "iat": now,
+        "exp": now + ttl_seconds,
+    }
+    return jwt.encode(claims, private_key, algorithm="RS256", headers={"kid": "test-key"})
+
+
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+def mcp_headers(token: str | None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def mcp_rpc(
+    client, method: str, params: dict | None = None, token: str | None = None, id_: int = 1
+):
+    """POST one JSON-RPC request to /mcp and return the httpx response."""
+    body = {"jsonrpc": "2.0", "id": id_, "method": method, "params": params or {}}
+    return client.post("/mcp", json=body, headers=mcp_headers(token))
+
+
+def mcp_call_tool(client, token: str, name: str, arguments: dict | None = None) -> dict:
+    """Call a tool and return the JSON-RPC `result` (CallToolResult shape)."""
+    response = mcp_rpc(client, "tools/call", {"name": name, "arguments": arguments or {}}, token)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "error" not in payload, payload
+    return payload["result"]

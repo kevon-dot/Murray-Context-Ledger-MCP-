@@ -105,6 +105,143 @@ policies, so it can read nothing.
 CI re-exports `SUPABASE_*` values from `supabase status` after `supabase
 start`, so the suite always runs against what actually started.
 
+## P1 — the MCP path: OAuth 2.1 resource server
+
+P1 adds a second authenticated surface: the MCP endpoint at `/mcp`
+(Streamable HTTP, stateless, JSON responses). The ledger is an **OAuth 2.1
+resource server** and Auth0 remains the only authorization server — we issue
+no tokens and run no login UI. Implemented against the current MCP
+authorization spec (revision **2025-11-25**, read from the spec source while
+building):
+
+```
+Claude / ChatGPT ── POST /mcp (no token) ──> 401
+    WWW-Authenticate: Bearer ..., resource_metadata=
+        "https://<host>/.well-known/oauth-protected-resource/mcp"
+    └─> client fetches that metadata → authorization_servers = [Auth0 tenant]
+        → discovers Auth0 (RFC 8414 / OIDC), registers itself (RFC 7591 DCR),
+          runs OAuth 2.1 + PKCE, returns with an access token
+Claude / ChatGPT ── POST /mcp (Bearer access token) ──> tools
+```
+
+Spec conformance points:
+
+* **RFC 9728 Protected Resource Metadata** served at both forms the spec
+  lists: path-inserted `/.well-known/oauth-protected-resource/mcp` (primary,
+  served by the MCP app) and root `/.well-known/oauth-protected-resource`
+  (fallback alias). `resource` comes from `RESOURCE_SERVER_URL` — set it to
+  the public URL when tunneling or deploying.
+* **401 challenges** carry `resource_metadata` in `WWW-Authenticate` (the
+  spec's primary discovery mechanism).
+* **Token validation**: every MCP request is verified by the same
+  `app/auth.py` code path as P0 — RS256 against the tenant JWKS (cached),
+  issuer, expiry — with the audience check extended to accept the **ledger
+  API identifier** (`AUTH0_API_AUDIENCE`) alongside the P0 client-ID
+  audience. Tokens not minted for this resource are rejected (the spec's
+  audience-binding MUST).
+* **Client identity**: the OAuth client ID arrives in the access token's
+  `azp` claim and keys the per-user `clients` registry row (created on first
+  contact with default scopes `{personal, work}`; revoked rows reject calls
+  with instructions to re-enable in the dashboard). If `azp` were ever
+  absent, a stable hash of the token's issuer+audience stands in.
+
+### Spec deviation log (P1)
+
+* **Auth0 does not implement RFC 8707 `resource`.** MCP clients MUST send the
+  `resource` parameter; Auth0 ignores it and uses its proprietary `audience`
+  parameter instead. Bridge: set the tenant **Default Audience** to the
+  ledger API identifier (docs/CONNECT.md Part 1.3) so tokens still arrive
+  audience-bound to the ledger. The server's own audience validation is what
+  enforces the spec's token-binding requirement.
+* **DB access token exchange.** The spec's security best practices forbid
+  **token passthrough**, and Auth0 access tokens cannot carry the literal
+  `role` claim PostgREST needs (stripped from access tokens, see P0 notes).
+  So the MCP layer never forwards the inbound token: after verification it
+  mints a short-lived (120 s) HS256 Data-API JWT for the *same verified
+  `sub`* signed with `SUPABASE_JWT_SECRET`, and uses that through the anon
+  client. Postgres RLS still enforces per-user isolation — the minted token
+  carries one `sub` and cannot bypass anything; the service role remains
+  unused on the request path. This refines P0's "caller's JWT" rule: the
+  caller's *identity* flows to Postgres; the caller's *credential* does not
+  transit beyond verification. (Hosted Supabase: requires the project's
+  legacy HS256 JWT secret to remain enabled.)
+* **Doc verification limits of this build environment.** The MCP spec was
+  verified from its source repository; Auth0's DCR docs and OpenAI's
+  connector docs were unreachable (network policy), so the Auth0 steps in
+  CONNECT.md follow the documented tenant flags as last known, and the
+  ChatGPT `search`/`fetch` result shapes were taken from OpenAI's official
+  deep-research MCP sample server (cookbook). Re-verify both consoles' UI
+  paths on first real connect.
+
+## P2–P6 — multi-tenant team memory (org tenancy + write path)
+
+The ledger is now **user-within-org**: every fact keeps its owner (`user_id`)
+and gains an `org_id`; org members share reads, audit stays per-person.
+Isolation moved from the per-user to the per-org boundary, but the enforcement
+model is unchanged — it is still Postgres RLS on the caller's JWT, never
+application code.
+
+### The membership function (the isolation pivot)
+
+`public.user_org_ids()` (migration `0003`) is the single most security-sensitive
+object in the repo. Every RLS policy on `facts`/`clients`/`audit_log`/`jobs` is
+re-keyed from `user_id = sub` to `org_id = any ((select public.user_org_ids())::uuid[])`.
+Its properties are load-bearing and must not be relaxed:
+
+* **`security invoker`, in `public`.** It runs as the caller and reads
+  `public.memberships` through that user's own `memberships_select_self` RLS
+  policy, so it can *structurally* only ever see the caller's rows — the result
+  is pinned to `auth.jwt()->>'sub'` by both this WHERE clause **and** the row
+  policy. This is deliberately *not* `security definer`: Supabase's migration
+  role is not a superuser (it cannot even create in the managed `auth` schema)
+  and has no `BYPASSRLS`, so a definer function owned by it would be subject to
+  `memberships`' force-RLS and read nothing. Invoker needs no privileged owner
+  and is strictly safer (two independent layers, no RLS bypass). It lives in
+  `public` (not `auth`) because the migration role can't write `auth`, and
+  because `public` is what makes it observable over the Data API — PostgREST
+  exposes RPC for `public` only — so the function-safety test calls it directly.
+* **filters on `auth.jwt()->>'sub'`** — it can *only ever return the calling
+  user's orgs*; it cannot be coerced to return another user's.
+  `tests/test_org_isolation.py` proves this directly (per-caller and for a
+  non-member, who resolves to the empty set and therefore sees zero rows).
+* **`stable` + `set search_path = ''` + schema-qualified** — the empty
+  search_path means nothing can be shadowed; `stable` lets the planner cache it
+  as an `InitPlan` evaluated once per query (the `::uuid[]` cast forces ANY's
+  array form so it both typechecks and stays cached).
+* **`service_role` stays off the request path.** Membership is resolved by this
+  function, not by a service-role read at request entry; the `memberships_select_self`
+  policy is all the app needs to read its own memberships in P3.
+
+### Request path, with org resolution
+
+The P0 diagram still holds; `_begin` adds one step after minting the caller's DB
+token: it reads the caller's memberships through the **caller-scoped** client
+(`memberships_select_self` returns exactly their rows — no service role) and
+binds a single `(org_id, role)` into `ToolContext`. v1 **fails closed**: zero or
+more-than-one memberships are rejected (the multi-org case is marked
+`TODO(multi-org)` — the function already returns an array, so the RLS layer needs
+no change when that lands). `_finish` stamps `org_id` on every audit row.
+
+### Writes
+
+`remember_facts` and `supersede_fact` insert through the caller-scoped client, so
+the org-member `WITH CHECK` (`org_id` in the caller's orgs **and** `user_id =
+sub`) is the real enforcement; `FactInput` (`server/app/schemas.py`) is only shape
+validation. Idempotency is a partial unique index on `(org_id, dedupe_key)` — a
+re-send is swallowed as a no-op. `connector_source` on the `clients` row attributes
+each write (Murray vs Claude vs ChatGPT); the audit trail names the writer via
+`audit_log.client_id → clients.connector_source`.
+
+### Roles and seats
+
+`ROLE_SCOPES` narrows what a seat *sees* within its org (owner unrestricted,
+office → `{account, work}`, rep → `{account, personal}`). This is a **product
+decision, not a security boundary** — org isolation is the hard boundary in
+Postgres and is unaffected by role scoping. Seat revocation
+(`clients.status = 'revoked'`, keyed per `(org_id, oauth_client_id)`) is an
+operator/service-role action (`server/app/admin.py`), never an authenticated MCP
+tool, and affects only the one seat.
+
 ## Workaround log
 
 * **No workaround needed for third-party auth itself**, but note the ID-token
@@ -123,11 +260,13 @@ start`, so the suite always runs against what actually started.
 | Variable | Meaning |
 | --- | --- |
 | `AUTH0_DOMAIN` | Tenant domain; issuer is `https://$AUTH0_DOMAIN/`, JWKS is fetched from it |
-| `AUTH0_AUDIENCE` | Accepted `aud` — the Auth0 application client ID (ID tokens) |
+| `AUTH0_AUDIENCE` | Accepted `aud` — the Auth0 application client ID (ID tokens, P0 path) |
+| `AUTH0_API_AUDIENCE` | Accepted `aud` — the Auth0 API identifier for the ledger (access tokens, MCP path) |
+| `RESOURCE_SERVER_URL` | Canonical public URL of `/mcp`; advertised as the RFC 9728 `resource` |
 | `SUPABASE_URL` | Supabase project / local stack URL |
 | `SUPABASE_ANON_KEY` | Publishable key; request path, RLS enforced |
 | `SUPABASE_SERVICE_ROLE_KEY` | BYPASSRLS key; pipeline jobs only |
-| `SUPABASE_JWT_SECRET` | Tests only: local stack's HS256 secret for minting user JWTs |
+| `SUPABASE_JWT_SECRET` | HS256 Data-API secret: the MCP layer mints short-lived per-user DB tokens with it; tests mint user JWTs with it |
 
 `server/app/config.py` loads these via pydantic-settings and raises at startup
 if any are missing — the app refuses to boot half-configured.
