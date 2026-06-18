@@ -61,7 +61,7 @@ def mint_db_token(sub: str, email: str | None = None, org_ids: list[str] | None 
     ``org_ids`` is optional and forward-looking only: when supplied it is added
     as an ``org_ids`` claim (list of strings) for clients that already know the
     caller's orgs. RLS does NOT read this claim — isolation is resolved in
-    Postgres by ``auth.user_org_ids()`` from the memberships table — so no
+    Postgres by ``public.user_org_ids()`` from the memberships table — so no
     policy depends on it and it is safe to omit.
     """
     settings = get_settings()

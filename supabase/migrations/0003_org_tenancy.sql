@@ -5,10 +5,10 @@
 -- gains an org_id; org members share reads; the audit trail stays per-person.
 --
 -- Isolation moves from per-user to per-org but still lives entirely in
--- Postgres. The new boundary is resolved by ONE security-definer function,
--- auth.user_org_ids(), which can only ever return the *calling* user's orgs
--- (it filters internally on auth.jwt()->>'sub'). service_role never touches
--- the request path.
+-- Postgres. The new boundary is resolved by ONE function, public.user_org_ids()
+-- (security invoker; see section 2), which can only ever return the *calling*
+-- user's orgs — it filters on auth.jwt()->>'sub' and reads memberships through
+-- that user's own RLS policy. service_role never touches the request path.
 --
 -- ASSUMPTION: the data tables (facts/clients/audit_log/jobs) are EMPTY
 -- (pre-launch). The guard below raises loudly if that is not true, so we never
@@ -39,19 +39,33 @@ create index memberships_user_idx on public.memberships(user_id);
 -- ---------------------------------------------------------------------------
 -- 2. Membership resolution — the single most security-sensitive object here.
 --
--- SECURITY DEFINER so it can read memberships under the function owner
--- (postgres / BYPASSRLS) even with force RLS on the table, but it can ONLY
--- return the caller's own orgs because it filters on auth.jwt()->>'sub'
--- internally. STABLE (one resolution per statement), pinned empty search_path,
--- and every table schema-qualified so nothing can be shadowed. Do not relax
--- any of these properties — they are the privilege-escalation guard.
+-- Returns ONLY the calling user's org ids. Two deliberate choices, both forced
+-- by how Supabase actually runs migrations (and both improvements):
+--
+--   * In `public`, not `auth`. The migration role cannot create objects in
+--     Supabase's managed `auth` schema (permission denied for schema auth), and
+--     a `public` function is exactly what makes it observable over the Data API
+--     for the function-safety test — PostgREST exposes RPC for `public` only.
+--   * SECURITY INVOKER, not definer. The migration role is not a superuser (see
+--     above) and therefore has no BYPASSRLS, so a definer function owned by it
+--     would still be subject to the force-RLS on memberships and read nothing.
+--     As invoker it runs as the caller and reads memberships through the narrow
+--     memberships_select_self policy, so it can STRUCTURALLY only ever see the
+--     caller's own rows — strictly safer than bypassing RLS (the result is
+--     pinned to auth.jwt()->>'sub' by this WHERE clause AND the row policy) and
+--     it needs no privileged owner. memberships_select_self also has no
+--     recursion risk: that policy does not call this function.
+--
+-- STABLE so the planner caches it as a once-per-query InitPlan; empty
+-- search_path + schema-qualified names so nothing can be shadowed. Do not relax
+-- STABLE / search_path / schema-qualification.
 -- ---------------------------------------------------------------------------
 
-create or replace function auth.user_org_ids()
+create or replace function public.user_org_ids()
 returns uuid[]
 language sql
 stable
-security definer
+security invoker
 set search_path = ''
 as $$
   select coalesce(array_agg(m.org_id), array[]::uuid[])
@@ -59,27 +73,8 @@ as $$
   where m.user_id = (auth.jwt() ->> 'sub')
 $$;
 
-revoke all on function auth.user_org_ids() from public;
-grant execute on function auth.user_org_ids() to authenticated, service_role;
-
--- A thin, read-only accessor so a caller (and the test suite) can observe
--- which orgs the SECURITY DEFINER function resolves for *them* over the Data
--- API — PostgREST only exposes RPC for `public`, not `auth`. SECURITY INVOKER:
--- it holds no privilege of its own and simply relays the locked-down function,
--- which already guarantees a caller sees only their own org ids (the same ids
--- memberships_select_self / orgs_select_member already expose). No new surface.
-create or replace function public.my_org_ids()
-returns uuid[]
-language sql
-stable
-security invoker
-set search_path = ''
-as $$
-  select auth.user_org_ids()
-$$;
-
-revoke all on function public.my_org_ids() from public;
-grant execute on function public.my_org_ids() to authenticated, service_role;
+revoke all on function public.user_org_ids() from public;
+grant execute on function public.user_org_ids() to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
 -- 3. Empty-table guard — MUST precede the NOT NULL org_id columns.
@@ -116,7 +111,7 @@ create index jobs_org_idx      on public.jobs(org_id);
 --
 -- Drop every per-user policy, then create org-member policies.
 --
--- Membership test idiom: `col = any ((select auth.user_org_ids())::uuid[])`.
+-- Membership test idiom: `col = any ((select public.user_org_ids())::uuid[])`.
 -- The scalar subselect makes the function an InitPlan the planner evaluates
 -- ONCE per query (the same caching trick 0001 uses for auth.jwt()), and the
 -- ::uuid[] cast is load-bearing: it forces ANY's array form (membership in the
@@ -134,19 +129,19 @@ drop policy facts_update_own on public.facts;
 
 create policy facts_select_org on public.facts
   for select to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 create policy facts_insert_org on public.facts
   for insert to authenticated
   with check (
-    org_id = any ((select auth.user_org_ids())::uuid[])
+    org_id = any ((select public.user_org_ids())::uuid[])
     and user_id = (select auth.jwt() ->> 'sub')
   );
 
 create policy facts_update_org on public.facts
   for update to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) )
-  with check ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) )
+  with check ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 -- clients ---------------------------------------------------------------------
 drop policy clients_select_own on public.clients;
@@ -155,19 +150,19 @@ drop policy clients_update_own on public.clients;
 
 create policy clients_select_org on public.clients
   for select to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 create policy clients_insert_org on public.clients
   for insert to authenticated
   with check (
-    org_id = any ((select auth.user_org_ids())::uuid[])
+    org_id = any ((select public.user_org_ids())::uuid[])
     and user_id = (select auth.jwt() ->> 'sub')
   );
 
 create policy clients_update_org on public.clients
   for update to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) )
-  with check ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) )
+  with check ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 -- audit_log (append-only: select + insert, nothing else) ----------------------
 drop policy audit_log_select_own on public.audit_log;
@@ -175,12 +170,12 @@ drop policy audit_log_insert_own on public.audit_log;
 
 create policy audit_select_org on public.audit_log
   for select to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 create policy audit_insert_org on public.audit_log
   for insert to authenticated
   with check (
-    org_id = any ((select auth.user_org_ids())::uuid[])
+    org_id = any ((select public.user_org_ids())::uuid[])
     and user_id = (select auth.jwt() ->> 'sub')
   );
 
@@ -191,19 +186,19 @@ drop policy jobs_update_own on public.jobs;
 
 create policy jobs_select_org on public.jobs
   for select to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 create policy jobs_insert_org on public.jobs
   for insert to authenticated
   with check (
-    org_id = any ((select auth.user_org_ids())::uuid[])
+    org_id = any ((select public.user_org_ids())::uuid[])
     and user_id = (select auth.jwt() ->> 'sub')
   );
 
 create policy jobs_update_org on public.jobs
   for update to authenticated
-  using ( org_id = any ((select auth.user_org_ids())::uuid[]) )
-  with check ( org_id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( org_id = any ((select public.user_org_ids())::uuid[]) )
+  with check ( org_id = any ((select public.user_org_ids())::uuid[]) );
 
 -- ---------------------------------------------------------------------------
 -- 6. RLS + grants on the tenancy tables.
@@ -223,7 +218,7 @@ alter table public.memberships force  row level security;
 
 create policy orgs_select_member on public.orgs
   for select to authenticated
-  using ( id = any ((select auth.user_org_ids())::uuid[]) );
+  using ( id = any ((select public.user_org_ids())::uuid[]) );
 
 create policy memberships_select_self on public.memberships
   for select to authenticated

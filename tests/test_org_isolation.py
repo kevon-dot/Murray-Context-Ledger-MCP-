@@ -6,10 +6,10 @@ single-user isolation gate:
   A. CROSS-ORG ISOLATION  — a member of org B reads zero of org A's facts.
   B. WITHIN-ORG SHARING   — a rep reads facts the owner wrote in the same org
                             (the team-memory property actually works).
-  C. FUNCTION SAFETY      — auth.user_org_ids() (observed via the public
-                            my_org_ids passthrough) returns ONLY the caller's
-                            orgs, despite bypassing RLS internally, and a user
-                            with no membership resolves to the empty set.
+  C. FUNCTION SAFETY      — public.user_org_ids() (called directly via RPC)
+                            returns ONLY the caller's orgs — it reads memberships
+                            through the caller's own RLS policy — and a user with
+                            no membership resolves to the empty set.
 
 Every request goes through the production factories (anon key + caller JWT, RLS
 in Postgres), exactly like test_rls_isolation.
@@ -194,22 +194,22 @@ def test_rep_still_isolated_from_org_b(setup, db_a2):
 
 
 # ---------------------------------------------------------------------------
-# C. Function safety — auth.user_org_ids() leaks nothing across callers
+# C. Function safety — public.user_org_ids() leaks nothing across callers
 # ---------------------------------------------------------------------------
 
 
 def test_user_org_ids_returns_only_callers_org_a(setup, db_a, db_a2):
-    assert db_a.rpc("my_org_ids").execute().data == [setup["org_a"]]
+    assert db_a.rpc("user_org_ids").execute().data == [setup["org_a"]]
     # A second member of the same org resolves to the same single org.
-    assert db_a2.rpc("my_org_ids").execute().data == [setup["org_a"]]
+    assert db_a2.rpc("user_org_ids").execute().data == [setup["org_a"]]
 
 
 def test_user_org_ids_returns_only_callers_org_b(setup, db_b):
-    assert db_b.rpc("my_org_ids").execute().data == [setup["org_b"]]
+    assert db_b.rpc("user_org_ids").execute().data == [setup["org_b"]]
 
 
 def test_user_org_ids_empty_for_non_member(setup, db_none):
-    assert db_none.rpc("my_org_ids").execute().data == []
+    assert db_none.rpc("user_org_ids").execute().data == []
 
 
 def test_non_member_sees_zero_facts(setup, db_none):

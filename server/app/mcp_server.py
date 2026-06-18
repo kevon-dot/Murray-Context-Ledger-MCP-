@@ -260,7 +260,7 @@ def _resolve_membership(db: Client, user_sub: str) -> tuple[str, str]:
     if len(rows) > 1:
         # TODO(multi-org): v1 deliberately binds a single org. To support
         # switching, accept an org selector on the tool/connector and pick among
-        # `rows` here instead of raising — auth.user_org_ids() already returns an
+        # `rows` here instead of raising — public.user_org_ids() already returns an
         # array, so the RLS layer needs no change.
         raise ValueError(MULTI_ORG_MESSAGE)
     return rows[0]["org_id"], rows[0]["role"]

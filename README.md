@@ -10,10 +10,11 @@ memory:
 - **Tenancy is user-within-org.** Every fact keeps an owner (`user_id`, the Auth0
   `sub`) **and** gains an `org_id`. Org members share reads; the audit trail stays
   per-person. Isolation moved from the per-user to the per-org boundary but still
-  lives entirely in Postgres — enforced by org-member RLS using the `SECURITY
-  DEFINER` function `auth.user_org_ids()` (stable, pinned `search_path=''`,
-  schema-qualified, filters on the caller's `sub` so it can only ever return the
-  caller's own orgs). The `service_role` never touches the request path.
+  lives entirely in Postgres — enforced by org-member RLS using the function
+  `public.user_org_ids()` (security invoker, stable, pinned `search_path=''`,
+  schema-qualified; reads the caller's own memberships via RLS so it can only
+  ever return the caller's own orgs). The `service_role` never touches the
+  request path.
 - **Writes**: `remember_facts` (batch, per-item, idempotent via a client-supplied
   `dedupe_key`, auto-promote to `active` at `confidence >= 0.9`) and
   `supersede_fact` (retire-and-replace via `superseded_by`). Every write is audited;
@@ -49,7 +50,7 @@ test suite runs unchanged against it.
 | Path | Purpose |
 | --- | --- |
 | `server/app/` | FastAPI app: `auth.py` (Auth0 JWT verification), `mcp_server.py` (MCP read+write tools, membership resolution, OAuth resource server), `schemas.py` (`FactInput` write validation), `db.py` (caller-scoped/service Supabase clients), `admin.py` (operator-only seat revoke), `config.py` (fail-fast settings), `main.py` (mounting, `/healthz`, RFC 9728 metadata) |
-| `supabase/migrations/` | All schema changes, numbered SQL only — never the dashboard. `0003` = org tenancy + RLS re-key + `auth.user_org_ids()`; `0004` = write path (`dedupe_key`, `connector_source`) |
+| `supabase/migrations/` | All schema changes, numbered SQL only — never the dashboard. `0003` = org tenancy + RLS re-key + `public.user_org_ids()`; `0004` = write path (`dedupe_key`, `connector_source`) |
 | `pipeline/` | Empty package — voice/NLP extraction lives in the Murray app, never here |
 | `tests/` | `test_rls_isolation` + `test_org_isolation` are the isolation gates; `test_membership_resolution`, `test_write_path`, `test_murray_contract`, `test_role_governance` gate P3–P6; `test_mcp_*` re-prove behavior through the MCP path |
 | `docs/AUTH.md` | Auth end to end: request path, OAuth 2.1 resource server, org tenancy |
@@ -61,8 +62,8 @@ test suite runs unchanged against it.
 - Request-path database access always uses the caller's JWT through the anon client,
   so **Postgres RLS enforces isolation** — not application discipline. The
   service-role key is for provisioning/pipeline jobs only and never on the request
-  path; membership is resolved by the `SECURITY DEFINER` function, not a service-role
-  read.
+  path; membership is resolved by the `public.user_org_ids()` function, not a
+  service-role read.
 - `user_id` is `text` holding the Auth0 `sub` claim; Supabase `auth.users` is unused.
   RLS reads identity via `auth.jwt()->>'sub'`, never `auth.uid()`.
 - Orgs and memberships are **service-role provisioned** in v1 (no authenticated

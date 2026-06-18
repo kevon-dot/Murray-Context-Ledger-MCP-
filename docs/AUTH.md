@@ -183,26 +183,34 @@ application code.
 
 ### The membership function (the isolation pivot)
 
-`auth.user_org_ids()` (migration `0003`) is the single most security-sensitive
+`public.user_org_ids()` (migration `0003`) is the single most security-sensitive
 object in the repo. Every RLS policy on `facts`/`clients`/`audit_log`/`jobs` is
-re-keyed from `user_id = sub` to `org_id = any ((select auth.user_org_ids())::uuid[])`.
-Its security properties are load-bearing and must not be relaxed:
+re-keyed from `user_id = sub` to `org_id = any ((select public.user_org_ids())::uuid[])`.
+Its properties are load-bearing and must not be relaxed:
 
-* **`security definer`** — it reads `public.memberships` under its owner
-  (`postgres`/`BYPASSRLS`), so it works even with `force row level security` on
-  that table, and **no broad membership SELECT policy is needed**.
-* **filters on `auth.jwt()->>'sub'` internally** — so despite bypassing RLS, it
-  can *only ever return the calling user's orgs*. It cannot be coerced to return
-  another user's orgs. `tests/test_org_isolation.py` proves this directly.
+* **`security invoker`, in `public`.** It runs as the caller and reads
+  `public.memberships` through that user's own `memberships_select_self` RLS
+  policy, so it can *structurally* only ever see the caller's rows — the result
+  is pinned to `auth.jwt()->>'sub'` by both this WHERE clause **and** the row
+  policy. This is deliberately *not* `security definer`: Supabase's migration
+  role is not a superuser (it cannot even create in the managed `auth` schema)
+  and has no `BYPASSRLS`, so a definer function owned by it would be subject to
+  `memberships`' force-RLS and read nothing. Invoker needs no privileged owner
+  and is strictly safer (two independent layers, no RLS bypass). It lives in
+  `public` (not `auth`) because the migration role can't write `auth`, and
+  because `public` is what makes it observable over the Data API — PostgREST
+  exposes RPC for `public` only — so the function-safety test calls it directly.
+* **filters on `auth.jwt()->>'sub'`** — it can *only ever return the calling
+  user's orgs*; it cannot be coerced to return another user's.
+  `tests/test_org_isolation.py` proves this directly (per-caller and for a
+  non-member, who resolves to the empty set and therefore sees zero rows).
 * **`stable` + `set search_path = ''` + schema-qualified** — the empty
   search_path means nothing can be shadowed; `stable` lets the planner cache it
   as an `InitPlan` evaluated once per query (the `::uuid[]` cast forces ANY's
   array form so it both typechecks and stays cached).
 * **`service_role` stays off the request path.** Membership is resolved by this
-  function, not by a service-role read at request entry. `public.my_org_ids()` is
-  a thin `security invoker` passthrough so a caller can observe their own org set
-  over the Data API (PostgREST exposes only `public`); it grants nothing the
-  `memberships_select_self` / `orgs_select_member` policies don't already.
+  function, not by a service-role read at request entry; the `memberships_select_self`
+  policy is all the app needs to read its own memberships in P3.
 
 ### Request path, with org resolution
 
