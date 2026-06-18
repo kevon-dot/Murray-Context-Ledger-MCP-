@@ -33,11 +33,13 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from postgrest.exceptions import APIError
+from pydantic import ValidationError
 from supabase import Client
 
 from app.auth import verify_token
 from app.config import get_settings
 from app.db import client_for_subject
+from app.schemas import FactInput
 
 # ---------------------------------------------------------------------------
 # Tool descriptions — product surface, written to steer host-model behavior.
@@ -71,12 +73,33 @@ PING_DESCRIPTION = (
     "Verifies the connection to the user's memory ledger. Returns a short "
     "status line including how many active facts the ledger holds."
 )
+REMEMBER_FACTS_DESCRIPTION = (
+    "Saves one or more already-structured facts about the account to the team's "
+    "shared memory. Each fact needs a `type` (identity, preference, state, "
+    "episodic, relationship, style, or behavioral), `content`, and a `confidence` "
+    "0..1; optional `scope_tags`, `source`, `source_ref`, and a `dedupe_key` that "
+    "makes re-sending the same fact a no-op. Facts at confidence >= 0.9 become "
+    "active (team-visible) immediately; lower ones wait in pending_review. "
+    "Returns a per-fact summary of what was created, deduped, or rejected."
+)
+SUPERSEDE_FACT_DESCRIPTION = (
+    "Replaces an existing fact with a corrected one: writes the new fact and "
+    "retires the old one (status 'superseded', linked via superseded_by). Use "
+    "when the account's reality changed or a prior fact was wrong. Pass the old "
+    "fact's id and the new fact in the same shape remember_facts accepts."
+)
 
 PROFILE_TOKEN_BUDGET = 400
 PROFILE_FACT_CAP = 30
 SEARCH_CONTEXT_LIMIT = 12
 RECENT_ACTIVITY_LIMIT = 10
 SNIPPET_CHARS = 200
+# Facts at/above this confidence land 'active' (instantly team-visible); below,
+# they wait in 'pending_review'. Tunable product knob, not a security boundary.
+AUTO_PROMOTE_CONFIDENCE = 0.9
+
+UNIQUE_VIOLATION = "23505"  # Postgres unique_violation (dedupe_key collision)
+NOT_FOUND_IN_ORG_MESSAGE = "No fact with that id exists in your org."
 
 REVOKED_CLIENT_MESSAGE = (
     "This client's access to the ledger has been revoked. Ask the user to "
@@ -175,6 +198,10 @@ class ToolContext:
     role: str
     client_row_id: str
     granted_scopes: list[str]
+    # The connector that owns this seat ('murray_app','claude',…), or None until
+    # the clients row is registered/backfilled. Every write is attributable to it
+    # via audit_log.client_id -> clients.connector_source.
+    connector_source: str | None
     tool: str
     arguments: dict[str, Any]
 
@@ -198,6 +225,7 @@ def _begin(tool: str, arguments: dict[str, Any]) -> ToolContext:
         role=role,
         client_row_id=client_row["id"],
         granted_scopes=list(client_row["granted_scopes"]),
+        connector_source=client_row.get("connector_source"),
         tool=tool,
         arguments=arguments,
     )
@@ -236,7 +264,7 @@ def _resolve_client(db: Client, org_id: str, user_sub: str, oauth_client_id: str
     """
     found = (
         db.table("clients")
-        .select("id,granted_scopes,status")
+        .select("id,granted_scopes,status,connector_source")
         .eq("org_id", org_id)
         .eq("oauth_client_id", oauth_client_id)
         .execute()
@@ -263,7 +291,7 @@ def _resolve_client(db: Client, org_id: str, user_sub: str, oauth_client_id: str
         if exc.code == "23505":  # unique violation: concurrent first contact
             return (
                 db.table("clients")
-                .select("id,granted_scopes,status")
+                .select("id,granted_scopes,status,connector_source")
                 .eq("org_id", org_id)
                 .eq("oauth_client_id", oauth_client_id)
                 .execute()
@@ -273,7 +301,11 @@ def _resolve_client(db: Client, org_id: str, user_sub: str, oauth_client_id: str
 
 
 def _finish(ctx: ToolContext, fact_ids: list[str]) -> None:
-    """Append the audit row. Raises on failure, failing the whole request."""
+    """Append the audit row. Raises on failure, failing the whole request.
+
+    For writes, ``fact_ids`` carries the rows the call created/superseded; the
+    connector that wrote them is attributable via client_id -> connector_source.
+    """
     payload = json.dumps(ctx.arguments, sort_keys=True, separators=(",", ":"), default=str)
     ctx.db.table("audit_log").insert(
         {
@@ -285,6 +317,66 @@ def _finish(ctx: ToolContext, fact_ids: list[str]) -> None:
             "fact_ids": fact_ids,
         }
     ).execute()
+
+
+# ---------------------------------------------------------------------------
+# Write-path helpers (P4)
+# ---------------------------------------------------------------------------
+
+
+def _fact_status(confidence: float) -> str:
+    return "active" if confidence >= AUTO_PROMOTE_CONFIDENCE else "pending_review"
+
+
+def _fact_row(ctx: ToolContext, fact: FactInput) -> dict[str, Any]:
+    """The DB row for an inbound fact, stamped with owner + org + auto-promoted
+    status. org_id/user_id come from ToolContext, never from the client."""
+    row: dict[str, Any] = {
+        "org_id": ctx.org_id,
+        "user_id": ctx.user_sub,
+        "type": fact.type,
+        "content": fact.content,
+        "confidence": fact.confidence,
+        "scope_tags": fact.scope_tags,
+        "source": fact.source,
+        "status": _fact_status(fact.confidence),
+    }
+    if fact.source_ref is not None:
+        row["source_ref"] = fact.source_ref
+    if fact.dedupe_key is not None:
+        row["dedupe_key"] = fact.dedupe_key
+    return row
+
+
+def _insert_fact(ctx: ToolContext, fact: FactInput) -> tuple[str, str]:
+    """Insert one stamped fact via the caller-scoped client (RLS enforces org
+    membership + user_id=sub on the WITH CHECK). Returns (outcome, fact_id),
+    outcome ∈ {'created','deduped'}: a dedupe_key collision (same org + key) is
+    swallowed as a no-op and resolves to the existing fact's id."""
+    try:
+        inserted = ctx.db.table("facts").insert(_fact_row(ctx, fact)).execute().data
+        return "created", inserted[0]["id"]
+    except APIError as exc:
+        if exc.code == UNIQUE_VIOLATION and fact.dedupe_key is not None:
+            existing = (
+                ctx.db.table("facts")
+                .select("id")
+                .eq("org_id", ctx.org_id)
+                .eq("dedupe_key", fact.dedupe_key)
+                .execute()
+                .data
+            )
+            if existing:
+                return "deduped", existing[0]["id"]
+        raise
+
+
+def _validation_errors(exc: ValidationError) -> list[dict[str, str]]:
+    """Flatten a pydantic ValidationError into clear, client-facing entries."""
+    return [
+        {"field": ".".join(str(p) for p in err["loc"]) or "(root)", "message": err["msg"]}
+        for err in exc.errors()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -497,3 +589,73 @@ def _register_tools(mcp: FastMCP) -> None:
         )
         _finish(ctx, [])
         return f"ledger ok — {response.count or 0} active facts for this user."
+
+    @mcp.tool(name="remember_facts", description=REMEMBER_FACTS_DESCRIPTION)
+    def remember_facts(facts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Batch write. Per-item: a malformed fact is reported and skipped so it
+        never drops the rest of a voice note; each accepted fact commits atomically
+        (created, or deduped on a dedupe_key collision). Every outcome is audited
+        and attributed to the connector via the client row."""
+        ctx = _begin("remember_facts", {"facts": facts})
+        created: list[str] = []
+        deduped: list[str] = []
+        invalid: list[dict[str, Any]] = []
+        touched: list[str] = []
+        for index, raw in enumerate(facts):
+            try:
+                fact = FactInput.model_validate(raw)
+            except ValidationError as exc:
+                invalid.append({"index": index, "errors": _validation_errors(exc)})
+                continue
+            outcome, fact_id = _insert_fact(ctx, fact)
+            touched.append(fact_id)
+            (created if outcome == "created" else deduped).append(fact_id)
+        _finish(ctx, touched)
+        return {
+            "created": created,
+            "deduped": deduped,
+            "invalid": invalid,
+            "counts": {
+                "created": len(created),
+                "deduped": len(deduped),
+                "invalid": len(invalid),
+            },
+            "connector_source": ctx.connector_source,
+        }
+
+    @mcp.tool(name="supersede_fact", description=SUPERSEDE_FACT_DESCRIPTION)
+    def supersede_fact(old_fact_id: str, new_fact: dict[str, Any]) -> dict[str, Any]:
+        """Retire one fact and replace it with a corrected one. Single fact, so
+        all-or-nothing: an invalid new_fact or an old_fact_id outside the caller's
+        org changes nothing. The org-member update policy lets any seat supersede
+        any fact in its org (office correcting a rep's fact across a handoff)."""
+        ctx = _begin("supersede_fact", {"old_fact_id": old_fact_id, "new_fact": new_fact})
+        try:
+            uuid_module.UUID(old_fact_id)
+        except ValueError:
+            _finish(ctx, [])
+            raise ValueError(f"'{old_fact_id}' is not a valid fact id.") from None
+        try:
+            fact = FactInput.model_validate(new_fact)
+        except ValidationError as exc:
+            _finish(ctx, [])
+            return {"superseded": None, "created": None, "invalid": _validation_errors(exc)}
+
+        # Confirm the target is in the caller's org first (RLS-scoped read), so a
+        # cross-org or unknown id never creates an orphan replacement.
+        target = ctx.db.table("facts").select("id").eq("id", old_fact_id).execute().data
+        if not target:
+            _finish(ctx, [])
+            return {"superseded": None, "created": None, "message": NOT_FOUND_IN_ORG_MESSAGE}
+
+        outcome, new_id = _insert_fact(ctx, fact)
+        ctx.db.table("facts").update({"superseded_by": new_id, "status": "superseded"}).eq(
+            "id", old_fact_id
+        ).execute()
+        _finish(ctx, [new_id, old_fact_id])
+        return {
+            "superseded": old_fact_id,
+            "created": new_id,
+            "new_status": _fact_status(fact.confidence),
+            "deduped": outcome == "deduped",
+        }
