@@ -101,6 +101,18 @@ AUTO_PROMOTE_CONFIDENCE = 0.9
 UNIQUE_VIOLATION = "23505"  # Postgres unique_violation (dedupe_key collision)
 NOT_FOUND_IN_ORG_MESSAGE = "No fact with that id exists in your org."
 
+# Role-aware read scoping (P6). Narrows what a seat SEES within its org by
+# intersecting the client's granted_scopes with the role's allowed scopes. This
+# is a product decision (which slice each role gets), NOT a security boundary —
+# org isolation is the hard boundary, enforced in Postgres by the RLS policies
+# from 0003. Tune freely here. None == no role narrowing (owner sees everything
+# its granted_scopes allow).
+ROLE_SCOPES: dict[str, set[str] | None] = {
+    "owner": None,
+    "office": {"account", "work"},
+    "rep": {"account", "personal"},
+}
+
 REVOKED_CLIENT_MESSAGE = (
     "This client's access to the ledger has been revoked. Ask the user to "
     "re-enable it in their ledger dashboard, then try again."
@@ -384,15 +396,27 @@ def _validation_errors(exc: ValidationError) -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _effective_scopes(ctx: ToolContext, scopes: list[str] | None = None) -> list[str]:
+    """The scopes a read may actually touch: the client's granted scopes (or an
+    explicit narrower set), further intersected with the caller's role slice
+    (ROLE_SCOPES). owner (None) is unrestricted; office/rep are narrowed. This is
+    the single place role visibility is decided — never a cross-org boundary."""
+    base = scopes if scopes is not None else ctx.granted_scopes
+    role_scopes = ROLE_SCOPES.get(ctx.role)
+    if role_scopes is None:
+        return list(base)
+    return [scope for scope in base if scope in role_scopes]
+
+
 def _scoped_active_facts(ctx: ToolContext, columns: str, scopes: list[str] | None = None):
-    """The one shared scope filter: facts whose scope_tags intersect the
-    client's granted scopes (optionally narrowed further), active only."""
-    effective = scopes if scopes is not None else ctx.granted_scopes
+    """The one shared scope filter: active facts whose scope_tags intersect the
+    caller's role-effective scopes. An empty effective set overlaps nothing, so
+    a fully-narrowed seat correctly sees zero facts."""
     return (
         ctx.db.table("facts")
         .select(columns)
         .eq("status", "active")
-        .overlaps("scope_tags", effective)
+        .overlaps("scope_tags", _effective_scopes(ctx, scopes))
     )
 
 
@@ -584,7 +608,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ctx.db.table("facts")
             .select("id", count="exact", head=True)
             .eq("status", "active")
-            .overlaps("scope_tags", ctx.granted_scopes)
+            .overlaps("scope_tags", _effective_scopes(ctx))
             .execute()
         )
         _finish(ctx, [])
