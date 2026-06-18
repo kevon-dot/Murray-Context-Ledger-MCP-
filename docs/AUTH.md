@@ -173,6 +173,67 @@ Spec conformance points:
   deep-research MCP sample server (cookbook). Re-verify both consoles' UI
   paths on first real connect.
 
+## P2–P6 — multi-tenant team memory (org tenancy + write path)
+
+The ledger is now **user-within-org**: every fact keeps its owner (`user_id`)
+and gains an `org_id`; org members share reads, audit stays per-person.
+Isolation moved from the per-user to the per-org boundary, but the enforcement
+model is unchanged — it is still Postgres RLS on the caller's JWT, never
+application code.
+
+### The membership function (the isolation pivot)
+
+`auth.user_org_ids()` (migration `0003`) is the single most security-sensitive
+object in the repo. Every RLS policy on `facts`/`clients`/`audit_log`/`jobs` is
+re-keyed from `user_id = sub` to `org_id = any ((select auth.user_org_ids())::uuid[])`.
+Its security properties are load-bearing and must not be relaxed:
+
+* **`security definer`** — it reads `public.memberships` under its owner
+  (`postgres`/`BYPASSRLS`), so it works even with `force row level security` on
+  that table, and **no broad membership SELECT policy is needed**.
+* **filters on `auth.jwt()->>'sub'` internally** — so despite bypassing RLS, it
+  can *only ever return the calling user's orgs*. It cannot be coerced to return
+  another user's orgs. `tests/test_org_isolation.py` proves this directly.
+* **`stable` + `set search_path = ''` + schema-qualified** — the empty
+  search_path means nothing can be shadowed; `stable` lets the planner cache it
+  as an `InitPlan` evaluated once per query (the `::uuid[]` cast forces ANY's
+  array form so it both typechecks and stays cached).
+* **`service_role` stays off the request path.** Membership is resolved by this
+  function, not by a service-role read at request entry. `public.my_org_ids()` is
+  a thin `security invoker` passthrough so a caller can observe their own org set
+  over the Data API (PostgREST exposes only `public`); it grants nothing the
+  `memberships_select_self` / `orgs_select_member` policies don't already.
+
+### Request path, with org resolution
+
+The P0 diagram still holds; `_begin` adds one step after minting the caller's DB
+token: it reads the caller's memberships through the **caller-scoped** client
+(`memberships_select_self` returns exactly their rows — no service role) and
+binds a single `(org_id, role)` into `ToolContext`. v1 **fails closed**: zero or
+more-than-one memberships are rejected (the multi-org case is marked
+`TODO(multi-org)` — the function already returns an array, so the RLS layer needs
+no change when that lands). `_finish` stamps `org_id` on every audit row.
+
+### Writes
+
+`remember_facts` and `supersede_fact` insert through the caller-scoped client, so
+the org-member `WITH CHECK` (`org_id` in the caller's orgs **and** `user_id =
+sub`) is the real enforcement; `FactInput` (`server/app/schemas.py`) is only shape
+validation. Idempotency is a partial unique index on `(org_id, dedupe_key)` — a
+re-send is swallowed as a no-op. `connector_source` on the `clients` row attributes
+each write (Murray vs Claude vs ChatGPT); the audit trail names the writer via
+`audit_log.client_id → clients.connector_source`.
+
+### Roles and seats
+
+`ROLE_SCOPES` narrows what a seat *sees* within its org (owner unrestricted,
+office → `{account, work}`, rep → `{account, personal}`). This is a **product
+decision, not a security boundary** — org isolation is the hard boundary in
+Postgres and is unaffected by role scoping. Seat revocation
+(`clients.status = 'revoked'`, keyed per `(org_id, oauth_client_id)`) is an
+operator/service-role action (`server/app/admin.py`), never an authenticated MCP
+tool, and affects only the one seat.
+
 ## Workaround log
 
 * **No workaround needed for third-party auth itself**, but note the ID-token
