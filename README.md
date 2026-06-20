@@ -19,6 +19,11 @@ memory:
   `dedupe_key`, auto-promote to `active` at `confidence >= 0.9`) and
   `supersede_fact` (retire-and-replace via `superseded_by`). Every write is audited;
   `connector_source` attributes the writer (Murray vs Claude vs ChatGPT).
+- **Review**: facts below the auto-promote threshold wait in `pending_review`;
+  owner/office triage them with `list_pending_facts` / `promote_fact` / `reject_fact`.
+- **Provisioning** is service-role only (no authenticated path): the
+  `scripts/ledger_admin.py` CLI creates orgs, grants seats, and registers
+  connectors. Deploy with the `Dockerfile`; full runbook in `docs/DEPLOY.md`.
 - **Roles**: `owner`/`rep`/`office` see appropriately different scope slices within
   an org (`ROLE_SCOPES`), and a single connector seat can be revoked without
   affecting the rest of the org. Role scoping narrows *within* an org; it is never
@@ -49,12 +54,15 @@ test suite runs unchanged against it.
 
 | Path | Purpose |
 | --- | --- |
-| `server/app/` | FastAPI app: `auth.py` (Auth0 JWT verification), `mcp_server.py` (MCP read+write tools, membership resolution, OAuth resource server), `schemas.py` (`FactInput` write validation), `db.py` (caller-scoped/service Supabase clients), `admin.py` (operator-only seat revoke), `config.py` (fail-fast settings), `main.py` (mounting, `/healthz`, RFC 9728 metadata) |
+| `server/app/` | FastAPI app: `auth.py` (Auth0 JWT verification), `mcp_server.py` (MCP read+write+review tools, membership resolution, OAuth resource server), `schemas.py` (`FactInput` write validation), `db.py` (caller-scoped/service Supabase clients), `admin.py` (operator provisioning + seat admin), `config.py` (fail-fast settings), `main.py` (mounting, `/healthz`, RFC 9728 metadata) |
+| `scripts/ledger_admin.py` | Operator CLI (service-role) for provisioning orgs/members/connectors and revoking seats — see `docs/DEPLOY.md` |
+| `Dockerfile` | Production image (`uvicorn app.main:app`); configured entirely from env |
 | `supabase/migrations/` | All schema changes, numbered SQL only — never the dashboard. `0003` = org tenancy + RLS re-key + `public.user_org_ids()`; `0004` = write path (`dedupe_key`, `connector_source`) |
 | `pipeline/` | Empty package — voice/NLP extraction lives in the Murray app, never here |
-| `tests/` | `test_rls_isolation` + `test_org_isolation` are the isolation gates; `test_membership_resolution`, `test_write_path`, `test_murray_contract`, `test_role_governance` gate P3–P6; `test_mcp_*` re-prove behavior through the MCP path |
+| `tests/` | `test_rls_isolation` + `test_org_isolation` are the isolation gates; `test_membership_resolution`, `test_write_path`, `test_murray_contract`, `test_role_governance`, `test_admin_provisioning`, `test_review_lifecycle` gate the rest; `test_mcp_*` re-prove behavior through the MCP path |
 | `docs/AUTH.md` | Auth end to end: request path, OAuth 2.1 resource server, org tenancy |
 | `docs/MURRAY_CONTRACT.md` | The authoritative Murray → Ledger wire contract (Contract v1) |
+| `docs/DEPLOY.md` | Production runbook: Supabase + Auth0 + server + provisioning |
 | `docs/CONNECT.md` | Step-by-step: Auth0 tenant setup, Claude + ChatGPT connector forms |
 
 ## Ground rules

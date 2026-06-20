@@ -88,6 +88,19 @@ SUPERSEDE_FACT_DESCRIPTION = (
     "when the account's reality changed or a prior fact was wrong. Pass the old "
     "fact's id and the new fact in the same shape remember_facts accepts."
 )
+LIST_PENDING_FACTS_DESCRIPTION = (
+    "Lists facts awaiting review (those that landed below the auto-promote "
+    "confidence and aren't team-visible yet), newest first. For owner/office "
+    "reviewers triaging the team's recent field notes before they go live."
+)
+PROMOTE_FACT_DESCRIPTION = (
+    "Approves a pending fact by id, making it active and visible to the whole "
+    "org. Owner/office only. Use after confirming a field note is correct."
+)
+REJECT_FACT_DESCRIPTION = (
+    "Rejects a pending fact by id so it never becomes team-visible. Owner/office "
+    "only. Optionally include a short reason for the audit trail."
+)
 
 PROFILE_TOKEN_BUDGET = 400
 PROFILE_FACT_CAP = 30
@@ -112,6 +125,14 @@ ROLE_SCOPES: dict[str, set[str] | None] = {
     "office": {"account", "work"},
     "rep": {"account", "personal"},
 }
+
+# Which roles may review (promote/reject) pending facts. Reps dictate field
+# notes; owner/office triage them. Like ROLE_SCOPES this is a product layer, not
+# the security boundary — tune freely.
+REVIEW_ROLES = frozenset({"owner", "office"})
+REVIEW_DENIED_MESSAGE = "Reviewing facts (promote/reject) is limited to the owner and office roles."
+NOT_PENDING_IN_ORG_MESSAGE = "No pending fact with that id is visible to you for review."
+PENDING_REVIEW_LIMIT = 20
 
 REVOKED_CLIENT_MESSAGE = (
     "This client's access to the ledger has been revoked. Ask the user to "
@@ -420,6 +441,18 @@ def _scoped_active_facts(ctx: ToolContext, columns: str, scopes: list[str] | Non
     )
 
 
+def _scoped_pending_facts(ctx: ToolContext, columns: str):
+    """The review queue: pending_review facts within the caller's role-effective
+    scopes. Mirrors _scoped_active_facts so reviewers see exactly the slice their
+    role grants — owner sees all, office the account/work slice, etc."""
+    return (
+        ctx.db.table("facts")
+        .select(columns)
+        .eq("status", "pending_review")
+        .overlaps("scope_tags", _effective_scopes(ctx))
+    )
+
+
 def _estimate_tokens(text: str) -> int:
     """Deliberately simple, deterministic budget estimate (~4 chars/token)."""
     return math.ceil(len(text) / 4)
@@ -683,3 +716,63 @@ def _register_tools(mcp: FastMCP) -> None:
             "new_status": _fact_status(fact.confidence),
             "deduped": outcome == "deduped",
         }
+
+    @mcp.tool(name="list_pending_facts", description=LIST_PENDING_FACTS_DESCRIPTION)
+    def list_pending_facts(limit: int = PENDING_REVIEW_LIMIT) -> dict[str, Any]:
+        """The review queue for owner/office: facts that landed below the
+        auto-promote threshold and aren't team-visible yet, role-scoped."""
+        ctx = _begin("list_pending_facts", {"limit": limit})
+        if ctx.role not in REVIEW_ROLES:
+            _finish(ctx, [])
+            raise ValueError(REVIEW_DENIED_MESSAGE)
+        capped = max(1, min(limit, PENDING_REVIEW_LIMIT))
+        rows = (
+            _scoped_pending_facts(ctx, "id,type,content,confidence,scope_tags,source,created_at")
+            .order("created_at", desc=True)
+            .order("id")
+            .limit(capped)
+            .execute()
+            .data
+        )
+        _finish(ctx, [row["id"] for row in rows])
+        return {"pending": rows, "count": len(rows)}
+
+    def _review_decision(fact_id: str, decision: str, reason: str | None = None) -> dict[str, Any]:
+        """Shared promote/reject path. Owner/office only; the target must be a
+        pending fact within the reviewer's role-scoped view."""
+        tool = "promote_fact" if decision == "promote" else "reject_fact"
+        key = "promoted" if decision == "promote" else "rejected"
+        args: dict[str, Any] = {"fact_id": fact_id}
+        if decision == "reject":
+            args["reason"] = reason
+        ctx = _begin(tool, args)
+        if ctx.role not in REVIEW_ROLES:
+            _finish(ctx, [])
+            raise ValueError(REVIEW_DENIED_MESSAGE)
+        try:
+            uuid_module.UUID(fact_id)
+        except ValueError:
+            _finish(ctx, [])
+            raise ValueError(f"'{fact_id}' is not a valid fact id.") from None
+
+        # The fact must be pending AND within the reviewer's role-scoped view;
+        # otherwise there is nothing this reviewer may act on (RLS + role scope).
+        found = _scoped_pending_facts(ctx, "id").eq("id", fact_id).execute().data
+        if not found:
+            _finish(ctx, [])
+            return {key: None, "message": NOT_PENDING_IN_ORG_MESSAGE}
+
+        new_status = "active" if decision == "promote" else "rejected"
+        ctx.db.table("facts").update({"status": new_status}).eq("id", fact_id).execute()
+        _finish(ctx, [fact_id])
+        return {key: fact_id, "status": new_status}
+
+    @mcp.tool(name="promote_fact", description=PROMOTE_FACT_DESCRIPTION)
+    def promote_fact(fact_id: str) -> dict[str, Any]:
+        """Approve a pending fact -> active (team-visible). Owner/office only."""
+        return _review_decision(fact_id, "promote")
+
+    @mcp.tool(name="reject_fact", description=REJECT_FACT_DESCRIPTION)
+    def reject_fact(fact_id: str, reason: str | None = None) -> dict[str, Any]:
+        """Reject a pending fact -> rejected (never team-visible). Owner/office only."""
+        return _review_decision(fact_id, "reject", reason)

@@ -27,6 +27,9 @@ EXPECTED_TOOLS = {
     "ping",
     "remember_facts",
     "supersede_fact",
+    "list_pending_facts",
+    "promote_fact",
+    "reject_fact",
 }
 
 # The two spec-quoted descriptions are product surface; pin them verbatim so a
