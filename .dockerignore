@@ -1,0 +1,25 @@
+# Keep the build context small and the image to runtime only.
+.git
+.github
+.venv
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Not needed at runtime (provisioning runs from a checkout, not the image).
+tests
+scripts
+docs
+*.md
+Makefile
+
+# Local stack / supabase CLI working dirs (migrations are applied via the CLI
+# against the target project, not baked into the image).
+supabase/.branches
+supabase/.temp
+
+# Secrets must come from the environment, never the image.
+.env
+.env.*

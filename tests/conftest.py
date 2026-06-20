@@ -87,6 +87,54 @@ def make_test_user(label: str) -> TestUser:
     return TestUser(sub=f"auth0|itest-{label}-{unique}", email=f"{label}-{unique}@example.com")
 
 
+# ---------------------------------------------------------------------------
+# Org tenancy (P2+) — service-role provisioning helpers.
+#
+# Orgs and memberships are provisioned by the service role in v1 (no
+# authenticated insert path), so these helpers take a service client. Tokens
+# stay sub-only: RLS resolves the caller's org from memberships in Postgres, so
+# the minting helpers above are unchanged and carry no org claim.
+# ---------------------------------------------------------------------------
+
+
+def make_test_org(service, name: str = "Test Org") -> str:
+    """Create an org via the service client; return its uuid."""
+    return service.table("orgs").insert({"name": name}).execute().data[0]["id"]
+
+
+def add_membership(service, org_id: str, user_sub: str, role: str = "rep") -> None:
+    """Attach a user (Auth0 sub) to an org with a role, via the service client."""
+    service.table("memberships").insert(
+        {"org_id": org_id, "user_id": user_sub, "role": role}
+    ).execute()
+
+
+def make_org_user(service, label: str, org_id: str, role: str = "rep") -> TestUser:
+    """A fresh test user already a member of `org_id` with `role` — the common
+    case (v1 assumes exactly one org per user)."""
+    user = make_test_user(label)
+    add_membership(service, org_id, user.sub, role)
+    return user
+
+
+def cleanup_orgs(service, user_subs: list[str]) -> None:
+    """Tear down all rows created for `user_subs`, FK-safe.
+
+    Child rows (facts/clients/audit_log/jobs carry org_id) and memberships are
+    removed before the orgs they reference. Org ids are discovered from the
+    users' memberships so callers need not track them.
+    """
+    member_rows = (
+        service.table("memberships").select("org_id").in_("user_id", user_subs).execute().data
+    )
+    org_ids = list({row["org_id"] for row in member_rows})
+    for table in ("audit_log", "facts", "jobs", "clients"):
+        service.table(table).delete().in_("user_id", user_subs).execute()
+    service.table("memberships").delete().in_("user_id", user_subs).execute()
+    if org_ids:
+        service.table("orgs").delete().in_("id", org_ids).execute()
+
+
 def mint_access_token(private_key, sub: str, azp: str, ttl_seconds: int = 600) -> str:
     """Sign an Auth0-shaped *access token* for the MCP path.
 

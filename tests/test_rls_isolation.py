@@ -20,15 +20,16 @@ from postgrest.exceptions import APIError
 from supabase import create_client
 
 from app.db import service_client, user_client
-from conftest import make_test_user, mint_user_jwt
+from conftest import add_membership, cleanup_orgs, make_test_org, make_test_user, mint_user_jwt
 
 CHECK_VIOLATION = "23514"  # Postgres check constraint
 NOT_AUTHORIZED = "42501"  # insufficient_privilege (missing grant or RLS with-check)
 
 
-def _valid_fact(user_sub: str) -> dict:
+def _valid_fact(user_sub: str, org_id: str) -> dict:
     return {
         "user_id": user_sub,
+        "org_id": org_id,
         "type": "preference",
         "content": "prefers espresso over filter coffee",
         "source": "user_manual",
@@ -90,17 +91,26 @@ def db_b(user_b):
 def db_service(user_a, user_b):
     service = service_client()
     yield service
-    # Cleanup with the service role (the only role that may delete); order
-    # respects audit_log -> clients FK.
-    test_subs = [user_a.sub, user_b.sub]
-    for table in ("audit_log", "facts", "jobs", "clients"):
-        service.table(table).delete().in_("user_id", test_subs).execute()
+    # Cleanup with the service role (the only role that may delete); FK-safe,
+    # and removes the orgs/memberships these users belonged to as well.
+    cleanup_orgs(service, [user_a.sub, user_b.sub])
 
 
 @pytest.fixture(scope="module")
-def a_fact(db_a, db_service, user_a):
+def orgs(db_service, user_a, user_b):
+    """userA in orgA, userB in orgB — isolation is now enforced at the org
+    boundary. Each owns their org so they can write their own facts."""
+    org_a = make_test_org(db_service, "rls-org-a")
+    org_b = make_test_org(db_service, "rls-org-b")
+    add_membership(db_service, org_a, user_a.sub, "owner")
+    add_membership(db_service, org_b, user_b.sub, "owner")
+    return {"a": org_a, "b": org_b}
+
+
+@pytest.fixture(scope="module")
+def a_fact(db_a, db_service, orgs, user_a):
     """A fact inserted by user A through the RLS-enforced client."""
-    response = db_a.table("facts").insert(_valid_fact(user_a.sub)).execute()
+    response = db_a.table("facts").insert(_valid_fact(user_a.sub, orgs["a"])).execute()
     assert len(response.data) == 1, "user A must be able to insert their own fact"
     return response.data[0]
 
@@ -162,9 +172,11 @@ def test_user_b_cannot_delete_a_fact(a_fact, db_a, db_b):
     assert still_there == [{"id": a_fact["id"]}]
 
 
-def test_user_b_cannot_insert_a_fact_owned_by_a(db_b, user_a, db_a, a_fact):
+def test_user_b_cannot_insert_a_fact_owned_by_a(db_b, user_a, db_a, a_fact, orgs):
+    # B spoofing a fact into A's org (and as A) is denied by the org-member
+    # WITH CHECK: orgA is not in B's orgs.
     with pytest.raises(APIError) as excinfo:
-        db_b.table("facts").insert(_valid_fact(user_a.sub)).execute()
+        db_b.table("facts").insert(_valid_fact(user_a.sub, orgs["a"])).execute()
     assert excinfo.value.code == NOT_AUTHORIZED
 
     rows_of_a = db_a.table("facts").select("id").execute().data
@@ -192,10 +204,17 @@ def test_unauthenticated_anon_reads_nothing(a_fact):
 # ---------------------------------------------------------------------------
 
 
-def test_audit_log_append_only(db_a, user_a):
+def test_audit_log_append_only(db_a, user_a, orgs):
     inserted = (
         db_a.table("audit_log")
-        .insert({"user_id": user_a.sub, "tool": "test_tool", "payload_hash": "abc123"})
+        .insert(
+            {
+                "user_id": user_a.sub,
+                "org_id": orgs["a"],
+                "tool": "test_tool",
+                "payload_hash": "abc123",
+            }
+        )
         .execute()
         .data
     )
@@ -220,16 +239,16 @@ def test_audit_log_append_only(db_a, user_a):
 # ---------------------------------------------------------------------------
 
 
-def test_invalid_fact_type_rejected(db_a, user_a):
-    bad = _valid_fact(user_a.sub) | {"type": "astrological"}
+def test_invalid_fact_type_rejected(db_a, user_a, orgs):
+    bad = _valid_fact(user_a.sub, orgs["a"]) | {"type": "astrological"}
     with pytest.raises(APIError) as excinfo:
         db_a.table("facts").insert(bad).execute()
     assert excinfo.value.code == CHECK_VIOLATION
 
 
 @pytest.mark.parametrize("confidence", [-0.1, 1.5])
-def test_out_of_range_confidence_rejected(db_a, user_a, confidence):
-    bad = _valid_fact(user_a.sub) | {"confidence": confidence}
+def test_out_of_range_confidence_rejected(db_a, user_a, orgs, confidence):
+    bad = _valid_fact(user_a.sub, orgs["a"]) | {"confidence": confidence}
     with pytest.raises(APIError) as excinfo:
         db_a.table("facts").insert(bad).execute()
     assert excinfo.value.code == CHECK_VIOLATION

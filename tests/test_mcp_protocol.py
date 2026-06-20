@@ -18,7 +18,19 @@ from app.mcp_server import (
 )
 from conftest import make_test_user, mcp_headers, mcp_rpc, mint_access_token
 
-EXPECTED_TOOLS = {"get_profile", "search_context", "get_recent_activity", "search", "fetch", "ping"}
+EXPECTED_TOOLS = {
+    "get_profile",
+    "search_context",
+    "get_recent_activity",
+    "search",
+    "fetch",
+    "ping",
+    "remember_facts",
+    "supersede_fact",
+    "list_pending_facts",
+    "promote_fact",
+    "reject_fact",
+}
 
 # The two spec-quoted descriptions are product surface; pin them verbatim so a
 # rewording shows up as a test failure, not a silent behavior change in hosts.
